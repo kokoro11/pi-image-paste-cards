@@ -5,7 +5,7 @@ export const PASTE_START = "\x1b[200~";
 export const PASTE_END = "\x1b[201~";
 const OSC_PREFIX = "\x1b]5522;";
 const IMAGE_MIMES = ["image/png", "image/jpeg", "image/webp", "image/gif"];
-const MAX_BYTES = 50 * 1024 * 1024;
+export const MAX_IMAGE_BYTES = 50 * 1024 * 1024;
 const MAX_PACKET_CHARS = 16 * 1024 * 1024;
 
 export type ImageBytes = { bytes: Buffer; mimeType: string };
@@ -48,8 +48,9 @@ export class EnhancedPaste {
 
     try {
       const status = metadata.get("status");
+      const state = this.state;
       if (status === "OK") {
-        if (this.state?.phase === "reading") return;
+        if (state?.phase === "reading") return;
         const password = metadata.get("pw");
         if (password && !/^[A-Za-z0-9+/=_-]{1,512}$/.test(password)) {
           return this.fail(t.oscAuth);
@@ -58,25 +59,24 @@ export class EnhancedPaste {
           phase: "listing", mimes: [], chunks: [], bytes: 0,
           password, location: metadata.get("loc") === "primary" ? "primary" : undefined,
         };
-      } else if (status === "DATA" && this.state) {
+      } else if (status === "DATA" && state) {
         const mime = decodeBase64(metadata.get("mime") ?? "").toString("utf8");
-        if (this.state.phase === "listing") {
+        if (state.phase === "listing") {
           if (mime === ".") {
-            this.state.dot = true;
+            state.dot = true;
             const list = decodeBase64(payload).toString("utf8").split(/\s+/);
-            this.state.mimes.push(...list.filter((value) => value && value !== "."));
+            state.mimes.push(...list.filter((value) => value && value !== "."));
           } else if (mime) {
-            this.state.mimes.push(mime);
+            state.mimes.push(mime);
           }
-          if (this.state.mimes.length > 64) return this.fail(t.oscMimes);
-        } else if (mime === this.state.mime && payload) {
+          if (state.mimes.length > 64) return this.fail(t.oscMimes);
+        } else if (mime === state.mime && payload) {
           const bytes = decodeBase64(payload);
-          this.state.bytes += bytes.length;
-          if (this.state.bytes > MAX_BYTES) return this.fail(t.oscTooLarge);
-          this.state.chunks.push(bytes);
+          state.bytes += bytes.length;
+          if (state.bytes > MAX_IMAGE_BYTES) return this.fail(t.oscTooLarge);
+          state.chunks.push(bytes);
         }
-      } else if (status === "DONE" && this.state) {
-        const state = this.state;
+      } else if (status === "DONE" && state) {
         if (state.phase === "listing") {
           const mime = IMAGE_MIMES.find((value) => state.mimes.includes(value)) ??
             (state.mimes.includes("text/plain") ? "text/plain" : undefined);
@@ -184,7 +184,8 @@ export class Osc5522Input {
   dispose(): void {
     if (this.timer) clearTimeout(this.timer);
     this.timer = undefined;
-    if (this.buffer && !this.packet && !this.discarding) this.callbacks.forward(this.buffer);
+    // A forwarded key can restart the terminal before its handler returns.
+    // Discard the old buffer so teardown cannot replay that key.
     this.buffer = "";
     this.decoder.end();
   }

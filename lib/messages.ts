@@ -1,10 +1,11 @@
 /** User-facing strings. */
 export const t = {
   imageTooLarge: "Image is empty or larger than 50 MiB",
-  bmpFailed: "BMP to PNG conversion failed (ImageMagick `convert` is required)",
+  bmpFailed: "Could not convert BMP to PNG",
   unsupportedImage: "Clipboard data is not a supported image format",
   windowsPath: "Could not convert the Windows image path",
   fileUnreadable: "Image file is unreadable or larger than 50 MiB",
+  linkOnly: "Pasted the file link. Permission to read the image was denied",
   notTriggered: "not triggered yet",
   notRead: "not read yet",
   reading: "Reading clipboard…",
@@ -41,5 +42,4 @@ export const t = {
   oscTimeout: "Terminal paste timed out",
   oscIncomplete: "Incomplete terminal paste data was discarded",
   oscPacketTooLarge: "Terminal paste packet was too large and was discarded",
-  moreImages: (n: number) => `+${n} more ${n === 1 ? "image" : "images"}`,
 };

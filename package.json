@@ -1,7 +1,7 @@
 {
   "name": "pi-image-paste-cards",
   "version": "0.1.5",
-  "description": "Paste clipboard images into pi as real attachments, with OMP-style 📷 #N chips and rounded preview cards, from Windows Terminal/WSLg, Wayland, X11 or an OSC 5522 terminal.",
+  "description": "Paste clipboard images into pi as real attachments with numbered labels, checksums, and dimensions, from Windows Terminal/WSLg, Wayland, X11 or an OSC 5522 terminal.",
   "type": "module",
   "license": "MIT",
   "author": "ImSven",
@@ -37,6 +37,9 @@
       "./extensions/image-paste.ts"
     ]
   },
+  "dependencies": {
+    "@imagemagick/magick-wasm": "^0.0.46"
+  },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",
@@ -46,6 +49,6 @@
     "node": ">=22.19.0"
   },
   "scripts": {
-    "test": "node --test --test-timeout=20000 test/*.test.mjs"
+    "test": "bun test --timeout 20000 test/"
   }
 }

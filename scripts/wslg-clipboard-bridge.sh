@@ -25,12 +25,10 @@ done
 LOCK_DIR="${XDG_RUNTIME_DIR:-/tmp}/wslg-clipboard-bridge.lock"
 if ! mkdir "$LOCK_DIR" 2>/dev/null; then
     # A lock older than a day is stale (e.g. after a crash): take it over.
-    if [ -d "$LOCK_DIR" ] && [ -n "$(find "$LOCK_DIR" -maxdepth 0 -mmin +1440 2>/dev/null)" ]; then
-        rmdir "$LOCK_DIR" 2>/dev/null || exit 0
-        mkdir "$LOCK_DIR" 2>/dev/null || exit 0
-    else
-        exit 0
-    fi
+    [ -d "$LOCK_DIR" ] || exit 0
+    [ -n "$(find "$LOCK_DIR" -maxdepth 0 -mmin +1440 2>/dev/null)" ] || exit 0
+    rmdir "$LOCK_DIR" 2>/dev/null || exit 0
+    mkdir "$LOCK_DIR" 2>/dev/null || exit 0
 fi
 trap 'rmdir "$LOCK_DIR" 2>/dev/null' EXIT INT TERM
 
