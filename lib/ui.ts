@@ -1,5 +1,6 @@
 import {
   getCapabilities,
+  getImageDimensions,
   hyperlink,
   truncateToWidth,
   type Component,
@@ -19,6 +20,15 @@ export interface Attachment {
 
 export function linkImageLabel(label: string, url?: string): string {
   return url ? `${label}(${url})` : label;
+}
+
+export function imageDimensions(data: string, mimeType: string): ImageDimensions | null {
+  // Pi decodes the whole base64 argument. PNG, GIF and WebP need at most 30
+  // bytes; JPEG may put the size after multiple large metadata segments.
+  const jpeg = mimeType === "image/jpeg";
+  const limit = jpeg ? 96 * 1024 : 40;
+  const dimensions = getImageDimensions(data.slice(0, limit), mimeType);
+  return dimensions ?? (jpeg && data.length > limit ? getImageDimensions(data, mimeType) : null);
 }
 
 export function imageSize(mimeType: string, dimensions: ImageDimensions | null): string {
@@ -65,17 +75,18 @@ export class AttachmentList implements Component {
     const padding = Math.min(this.getOutputPad(), Math.floor((width - 1) / 2));
     const margin = " ".repeat(padding);
     const contentWidth = width - 2 * padding;
-    const rows = attachments.map((attachment) => {
+    const rows = [`${margin}${this.styleLine(truncateToWidth(ATTACHED_IMAGES_HEADING, contentWidth, ""))}${margin}`];
+    for (let i = 0; i < attachments.length; i++) {
+      const attachment = attachments[i]!;
       const size = imageSize(attachment.mimeType, attachment.dimensions);
       const { label, sourceUrl: url } = attachment;
       const urlWidth = contentWidth - label.length - size.length - 3;
-      if (url && urlWidth > 0) {
-        return `${renderImageLink(label, url, truncateToWidth(url, urlWidth, "…"))} ${size}`;
-      }
-      return truncateToWidth(`${renderImageLabel(label, url)} ${size}`, contentWidth, "");
-    });
-    rows.unshift(truncateToWidth(ATTACHED_IMAGES_HEADING, contentWidth, ""));
-    return rows.map((row) => `${margin}${this.styleLine(row)}${margin}`);
+      const row = url && urlWidth > 0
+        ? `${renderImageLink(label, url, truncateToWidth(url, urlWidth, "…"))} ${size}`
+        : truncateToWidth(`${renderImageLabel(label, url)} ${size}`, contentWidth, "");
+      rows.push(`${margin}${this.styleLine(row)}${margin}`);
+    }
+    return rows;
   }
 }
 
@@ -85,14 +96,21 @@ type DecoratableEditor = Component & {
   segment?: (text: string, mode?: string) => Iterable<Intl.SegmentData>;
 };
 
-export function decorateImageTokens(editor: DecoratableEditor, lookup: (label: string) => Attachment | undefined): () => void {
+export function decorateImageTokens(editor: DecoratableEditor, attachments: ReadonlyMap<string, Attachment>): () => void {
   const originalRender = editor.render;
   const originalSegment = editor.segment;
-  const render = (width: number) => originalRender.call(editor, width).map((line) =>
-    replaceImageLabels(line, (label) => renderImageLabel(label, lookup(label)?.sourceUrl)));
-  const segment = (text: string, mode?: string) => {
-    const spans = imageTokens(text).filter((token) => lookup(token.label));
-    const source = originalSegment!.call(editor, text, mode);
+  const render = (width: number) => {
+    const lines = originalRender.call(editor, width);
+    if (!attachments.size || !getCapabilities().hyperlinks) return lines;
+    return lines.map((line) => replaceImageLabels(line, (label) => {
+      const url = attachments.get(label)?.sourceUrl;
+      return url ? hyperlink(label, url) : label;
+    }));
+  };
+  const segment = originalSegment && ((text: string, mode?: string) => {
+    const source = originalSegment.call(editor, text, mode);
+    if (!attachments.size || !text.includes("[Image #")) return source;
+    const spans = imageTokens(text).filter((token) => attachments.has(token.label));
     if (!spans.length) return source;
     const result: Intl.SegmentData[] = [];
     let current = 0;
@@ -103,7 +121,7 @@ export function decorateImageTokens(editor: DecoratableEditor, lookup: (label: s
         emitted = false;
       }
       const token = spans[current];
-      if (!token || part.index < token.start || part.index >= token.end) {
+      if (!token || part.index < token.start) {
         result.push(part);
         continue;
       }
@@ -112,9 +130,9 @@ export function decorateImageTokens(editor: DecoratableEditor, lookup: (label: s
       emitted = true;
     }
     return result;
-  };
+  });
   editor.render = render;
-  if (originalSegment) editor.segment = segment;
+  if (segment) editor.segment = segment;
   return () => {
     if (editor.render === render) editor.render = originalRender;
     if (editor.segment === segment) editor.segment = originalSegment;

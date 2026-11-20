@@ -8,7 +8,7 @@ const { Editor, KeybindingsManager, TUI_KEYBINDINGS, setKeybindings, setCapabili
 const { stripTerminalSequences, visibleWidth } = await tuiModule("dist/utils.js");
 // Resolve the UI's peer dependency even when Pi is installed outside the project.
 mock.module("@earendil-works/pi-tui", () => tui);
-const { AttachmentList, decorateImageTokens, imageTokens } = await import("../lib/ui.ts");
+const { AttachmentList, decorateImageTokens, imageDimensions, imageTokens } = await import("../lib/ui.ts");
 const plain = { images: null, trueColor: true, hyperlinks: false };
 const firstLabel = "[Image #1 82a291]";
 const secondLabel = "[Image #2 82a291]";
@@ -58,7 +58,7 @@ test("real Pi editor treats an image label as one grapheme and links it without 
   const originalSegment = editor.segment;
   const originalRender = editor.render;
   const url = pathToFileURL("/tmp/original.png").href;
-  const restore = decorateImageTokens(editor, (label) => label === firstLabel ? attachment(label, undefined, url) : undefined);
+  const restore = decorateImageTokens(editor, new Map([[firstLabel, attachment(firstLabel, undefined, url)]]));
   editor.setText(`prefix ${firstLabel}`);
   assert.equal([...editor.segment(editor.getText(), "grapheme")].at(-1).segment, firstLabel);
   const lines = editor.render(80);
@@ -81,4 +81,12 @@ test("token parser requires a number and six hexadecimal characters", () => {
   const tenthLabel = "[Image #10 45a3b7]";
   const text = `${firstLabel} [Image #1] [Image 82a291] [Image #1 82a291a] [Image #1 82a29] [Image #1 82a29g] ${tenthLabel} ${firstLabel}`;
   assert.deepEqual(imageTokens(text).map((token) => token.label), [firstLabel, tenthLabel, firstLabel]);
+});
+
+test("JPEG dimensions can follow multiple large metadata segments", () => {
+  const app = Buffer.alloc(65_537);
+  app.set([0xff, 0xe1, 0xff, 0xff]);
+  const frame = Buffer.from([0xff, 0xc0, 0, 11, 8, 0, 80, 0, 120, 1, 1, 0x11, 0]);
+  const jpeg = Buffer.concat([Buffer.from([0xff, 0xd8]), app, app, frame]);
+  assert.deepEqual(imageDimensions(jpeg.toString("base64"), "image/jpeg"), { widthPx: 120, heightPx: 80 });
 });

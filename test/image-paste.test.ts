@@ -438,7 +438,15 @@ test("identical drafts keep their numbers and checksum when reordered and sent",
     const rows = [`${fixtureLabel}(${url}) 1x1`, `${duplicateLabel}(${secondUrl}) 1x1`];
     assert.deepEqual(plainLines(h.render(240)), [` ${previewHeading}`, ` ${rows[0]}`, ` ${rows[1]}`]);
     assert.equal(h.text.trim(), `${fixtureLabel} ${duplicateLabel}`);
+    assert.equal(h.input(" "), undefined);
     h.ctx.ui.setEditorText(`${duplicateLabel} ${fixtureLabel} OCR`);
+    // The terminal listener persists the new order before shutdown or submission.
+    let firstSavedPath = backing;
+    for (let n = 0; n < 100 && firstSavedPath === backing; n++) {
+      await sleep(5);
+      firstSavedPath = await h.draftFile().catch(() => backing);
+    }
+    assert.notEqual(firstSavedPath, backing);
     assert.deepEqual(plainLines(h.render(240)), [` ${previewHeading}`, ` ${rows[1]}`, ` ${rows[0]}`]);
     const result = await h.emit("input", { source: "interactive", text: h.text });
     assert.equal(result.text, `${duplicateLabel}(${secondUrl}) ${fixtureLabel}(${url}) OCR`);

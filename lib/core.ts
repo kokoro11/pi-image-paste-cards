@@ -94,7 +94,7 @@ export class EnhancedPaste {
             : `${OSC_PREFIX}${fields.join(":")}:mime=${encoded}\x07`);
         } else {
           this.reset();
-          const bytes = Buffer.concat(state.chunks, state.bytes);
+          const bytes = state.chunks.length === 1 ? state.chunks[0]! : Buffer.concat(state.chunks, state.bytes);
           if (!bytes.length) return this.callbacks.error(t.oscEmpty);
           if (state.mime === "text/plain") this.callbacks.text(bytes.toString("utf8"));
           else this.callbacks.image({ bytes, mimeType: state.mime! });
@@ -141,10 +141,9 @@ function decodeBase64(value: string): Buffer {
 export class Osc5522Input {
   private decoder = new StringDecoder("utf8");
   private buffer = "";
-  private packet = false;
-  private discarding = false;
-  private bracketed = false;
-  private searchFrom = 0;
+  private mode: "input" | "paste" | "packet" | "discard" = "input";
+  private packetParts: string[] = [];
+  private packetLength = 0;
   private timer?: ReturnType<typeof setTimeout>;
 
   constructor(private callbacks: {
@@ -158,26 +157,26 @@ export class Osc5522Input {
     this.timer = undefined;
     // Preserve Pi's legacy high-bit Alt encoding for single-byte input.
     const text = Buffer.isBuffer(data)
-      ? data.length === 1 && data[0]! > 127 && !this.packet && !this.bracketed
+      ? data.length === 1 && data[0]! > 127 && (this.mode === "input" || this.mode === "discard")
         ? `\x1b${String.fromCharCode(data[0]! - 128)}`
         : this.decoder.write(data)
       : data;
     this.buffer += text;
     this.drain();
-    if (this.buffer) {
+    if (this.buffer || this.mode === "packet") {
+      const receivingPacket = this.mode === "packet" || this.mode === "discard";
       this.timer = setTimeout(() => {
         this.timer = undefined;
-        if (this.packet || this.discarding) {
-          this.buffer = "";
-          this.packet = false;
-          this.discarding = true;
+        const remaining = this.buffer;
+        this.buffer = "";
+        if (receivingPacket) {
+          this.clearPacket();
+          this.mode = "discard";
           this.callbacks.error(t.oscIncomplete);
         } else {
-          const remaining = this.buffer;
-          this.buffer = "";
           this.callbacks.forward(remaining);
         }
-      }, this.packet || this.discarding ? 5_000 : 20);
+      }, receivingPacket ? 5_000 : 20);
     }
   }
 
@@ -187,77 +186,102 @@ export class Osc5522Input {
     // A forwarded key can restart the terminal before its handler returns.
     // Discard the old buffer so teardown cannot replay that key.
     this.buffer = "";
+    this.clearPacket();
+    this.mode = "input";
     this.decoder.end();
+  }
+
+  private clearPacket(): void {
+    this.packetParts.length = 0;
+    this.packetLength = 0;
+  }
+
+  private readPacket(): boolean {
+    const chunk = this.buffer;
+    const bel = chunk.indexOf("\x07");
+    const st = chunk.indexOf("\x1b\\");
+    const end = bel < 0 ? st : st < 0 ? bel : Math.min(bel, st);
+    if (end < 0) {
+      // Hold just enough input to recognize an ST split across reads. Searching
+      // the accumulated packet would repeatedly flatten it on every fragment.
+      this.buffer = chunk.endsWith("\x1b") ? "\x1b" : "";
+      if (this.mode === "packet") {
+        if (this.packetLength + chunk.length > MAX_PACKET_CHARS) {
+          this.clearPacket();
+          this.mode = "discard";
+          this.callbacks.error(t.oscPacketTooLarge);
+        } else {
+          const part = this.buffer ? chunk.slice(0, -1) : chunk;
+          if (part) this.packetParts.push(part);
+          this.packetLength += part.length;
+        }
+      }
+      return false;
+    }
+
+    const length = end + (end === bel ? 1 : 2);
+    this.buffer = chunk.slice(length);
+    let packet: string | undefined;
+    if (this.mode === "packet" && this.packetLength + length <= MAX_PACKET_CHARS) {
+      packet = chunk.slice(0, length);
+      if (this.packetParts.length) {
+        this.packetParts.push(packet);
+        packet = this.packetParts.join("");
+      }
+    }
+    this.clearPacket();
+    this.mode = "input";
+    if (packet !== undefined) this.callbacks.packet(packet);
+    return true;
   }
 
   private drain(): void {
     while (this.buffer) {
-      if (this.packet || this.discarding) {
-        const bel = this.buffer.indexOf("\x07", this.searchFrom);
-        const st = this.buffer.indexOf("\x1b\\", this.searchFrom);
-        const end = bel < 0 ? st : st < 0 ? bel : Math.min(bel, st);
-        if (end < 0) {
-          if (this.buffer.length > MAX_PACKET_CHARS || this.discarding) {
-            if (!this.discarding) this.callbacks.error(t.oscPacketTooLarge);
-            this.discarding = true;
-            this.buffer = this.buffer.endsWith("\x1b") ? "\x1b" : "";
-          }
-          this.searchFrom = Math.max(0, this.buffer.length - 1);
-          return;
-        }
-        const length = end + (end === bel ? 1 : 2);
-        const packet = this.buffer.slice(0, length);
-        this.buffer = this.buffer.slice(length);
-        if (!this.discarding && length <= MAX_PACKET_CHARS) this.callbacks.packet(packet);
-        this.packet = this.discarding = false;
-        this.searchFrom = 0;
+      if (this.mode === "packet" || this.mode === "discard") {
+        if (!this.readPacket()) return;
         continue;
       }
 
-      if (this.bracketed) {
+      if (this.mode === "paste") {
         const end = this.buffer.indexOf(PASTE_END);
         if (end >= 0) {
-          this.callbacks.forward(this.buffer.slice(0, end + PASTE_END.length));
-          this.buffer = this.buffer.slice(end + PASTE_END.length);
-          this.bracketed = false;
+          this.mode = "input";
+          this.forward(end + PASTE_END.length);
           continue;
         }
-        this.forwardExceptPartial(PASTE_END);
+        let keep = Math.min(PASTE_END.length - 1, this.buffer.length);
+        while (keep && !PASTE_END.startsWith(this.buffer.slice(-keep))) keep--;
+        this.forward(this.buffer.length - keep);
         return;
       }
 
       const escape = this.buffer.indexOf("\x1b");
       if (escape < 0) {
-        this.callbacks.forward(this.buffer);
-        this.buffer = "";
+        this.forward(this.buffer.length);
         return;
       }
       if (escape > 0) {
-        this.callbacks.forward(this.buffer.slice(0, escape));
-        this.buffer = this.buffer.slice(escape);
+        this.forward(escape);
+        continue;
       }
       if (this.buffer.startsWith(OSC_PREFIX)) {
-        this.packet = true;
-        this.searchFrom = OSC_PREFIX.length;
+        this.mode = "packet";
       } else if (this.buffer.startsWith(PASTE_START)) {
-        this.callbacks.forward(PASTE_START);
-        this.buffer = this.buffer.slice(PASTE_START.length);
-        this.bracketed = true;
+        this.mode = "paste";
+        this.forward(PASTE_START.length);
       } else if (OSC_PREFIX.startsWith(this.buffer) || PASTE_START.startsWith(this.buffer)) {
         return;
       } else {
         // Let the original parser assemble CSI/Alt keys without our interpreting them.
-        this.callbacks.forward("\x1b");
-        this.buffer = this.buffer.slice(1);
+        this.forward(1);
       }
     }
   }
 
-  private forwardExceptPartial(marker: string): void {
-    let keep = Math.min(marker.length - 1, this.buffer.length);
-    while (keep && !marker.startsWith(this.buffer.slice(-keep))) keep--;
-    const end = this.buffer.length - keep;
-    if (end) this.callbacks.forward(this.buffer.slice(0, end));
+  private forward(end: number): void {
+    if (!end) return;
+    const text = this.buffer.slice(0, end);
     this.buffer = this.buffer.slice(end);
+    this.callbacks.forward(text);
   }
 }

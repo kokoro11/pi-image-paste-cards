@@ -88,6 +88,19 @@ test("fragmented OSC packets are intercepted before stock stdin parser; ordinary
   t.filter.dispose();
 });
 
+test("an oversized fragmented reply is discarded through its terminator", () => {
+  const t = transport();
+  t.filter.push("\x1b]5522;");
+  t.filter.push("A".repeat(16 * 1024 * 1024));
+  t.filter.push("escaped payload tail\x1b");
+  const next = packet("status=OK");
+  t.filter.push(`\\${next}\r`);
+  assert.equal(t.errors.length, 1);
+  assert.deepEqual(t.packets, [next]);
+  assert.equal(t.forwarded.join(""), "\r");
+  t.filter.dispose();
+});
+
 test("OSC-looking text within a fragmented bracketed paste stays literal", () => {
   const t = transport();
   const p = `${PASTE_START}${packet("status=OK")}${PASTE_END}\r`;

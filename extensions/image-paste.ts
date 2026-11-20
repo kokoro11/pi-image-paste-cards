@@ -1,10 +1,8 @@
 import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
-import { getImageDimensions, getKeybindings, isKeyRelease, matchesKey, Text, type Component, type Editor, type TUI } from "@earendil-works/pi-tui";
+import { getKeybindings, isKeyRelease, matchesKey, Text, type Component, type Editor, type TUI } from "@earendil-works/pi-tui";
 import type { ImageContent } from "@earendil-works/pi-ai";
-import { createHash, randomUUID } from "node:crypto";
-import { lstat, readdir, readFile, unlink, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { basename, join } from "node:path";
+import { createHash } from "node:crypto";
+import { basename } from "node:path";
 import { pathToFileURL } from "node:url";
 import {
   clipboardFilePaths,
@@ -16,6 +14,7 @@ import {
   resolveImagePath,
 } from "../lib/clipboard.ts";
 import { PASTE_START, PASTE_END, type ImageBytes } from "../lib/core.ts";
+import { DraftFiles, type DraftRecord } from "../lib/draft-files.ts";
 import { installEnhancedPaste } from "../lib/terminal.ts";
 import { t } from "../lib/messages.ts";
 import {
@@ -23,6 +22,7 @@ import {
   AttachmentList,
   IMAGE_LINK,
   decorateImageTokens,
+  imageDimensions,
   imageSize,
   imageTokens,
   linkImageLabel,
@@ -33,12 +33,6 @@ import {
 
 const PREVIEW_ENTRY_TYPE = "image-paste-preview";
 const PREVIEW_ROW = /^(\[Image #([1-9]\d*)(?: ([0-9a-f]{6}))?\])(?:\((file:\/\/[^\s\p{Cc}()]+)\))? /gmu;
-const TEMP_PREFIX = "pi-image-paste-";
-const TEMP_IMAGE_NAME = new RegExp(`^${TEMP_PREFIX}[0-9a-f-]{36}\\.(?:png|jpg|webp|gif)$`);
-const STALE_MS = 7 * 24 * 60 * 60 * 1000;
-const IMAGE_EXTENSIONS: Record<string, string> = {
-  "image/png": "png", "image/jpeg": "jpg", "image/webp": "webp", "image/gif": "gif",
-};
 
 function imageLabel(id: number, bytes: Buffer): string {
   const code = createHash("sha256").update(bytes).digest("hex").slice(0, 6);
@@ -61,12 +55,11 @@ function userContent(entry: SessionEntry | undefined) {
 }
 
 export default function imagePaste(pi: ExtensionAPI) {
-  type DraftRecord = { id: number; sourceUrl?: string } &
-    ({ path: string } | { messageId: string; imageIndex: number; label: string });
   type DraftImage = Attachment & { record: DraftRecord; content: ImageContent };
-  type DraftManifest = { version: 2; nextId: number; images: DraftRecord[] };
   type FocusedComponent = Component & Partial<Pick<Editor, "getCursor" | "getLines">>;
   type CapturedTUI = TUI & { getFocusedComponent(): FocusedComponent | null };
+  const files = new DraftFiles();
+  const noDrafts: readonly DraftImage[] = [];
 
   let context: ExtensionContext | undefined;
   let tui: CapturedTUI | undefined;
@@ -77,72 +70,37 @@ export default function imagePaste(pi: ExtensionAPI) {
   let cleanupInput: (() => void) | undefined;
   let cleanupTransport: (() => void) | undefined;
   let nextAttachmentId = 1;
-  let manifestSignature = "";
-  let manifestWrites = Promise.resolve();
+  let selectedText: string | undefined;
+  let selectedDrafts = noDrafts;
+  let manifest: string | undefined;
+  let draftSyncQueued = false;
   const submittedDrafts: Array<{ text: string; labels: string[]; draftLabels: string[] }> = [];
   let pendingPreview: string | undefined;
   let treeTargetId: string | undefined;
   const queuedInput: string[] = [];
   const drafts = new Map<string, DraftImage>();
-  const createdFiles = new Set<string>();
   const diagnostics = { trigger: t.notTriggered, result: t.notRead, events: 0, trace: false, lastEvent: "" };
   const getOutputPad = () => pi.getSettings().outputPad === 0 ? 0 : 1;
 
-  const activeDrafts = (text = context?.ui.getEditorText() ?? ""): DraftImage[] => {
+  const activeDrafts = (text?: string): readonly DraftImage[] => {
+    if (!drafts.size) return noDrafts;
+    text ??= context?.ui.getEditorText() ?? "";
+    if (text === selectedText) return selectedDrafts;
     const seen = new Set<string>();
     const result: DraftImage[] = [];
     for (const token of imageTokens(text)) {
       const draft = drafts.get(token.label);
       if (draft && !seen.has(token.label)) { seen.add(token.label); result.push(draft); }
     }
-    return result;
+    // Typing between labels doesn't change the ordered selection or manifest.
+    if (result.length !== selectedDrafts.length || result.some((draft, i) => draft !== selectedDrafts[i])) {
+      selectedDrafts = result.length ? result : noDrafts;
+    }
+    selectedText = text;
+    return selectedDrafts;
   };
-  const lookup = (label: string) => drafts.get(label);
   const redraw = () => { tui?.requestRender(); };
-  const manifestPath = () => context
-    ? join(tmpdir(), `${TEMP_PREFIX}draft-${context.sessionManager.getSessionId()}.json`) : undefined;
-  const validTempPath = (path: string) => {
-    if (typeof path !== "string") return false;
-    const name = basename(path);
-    return TEMP_IMAGE_NAME.test(name) && path === join(tmpdir(), name);
-  };
-
-  const dropFiles = async (paths: Iterable<string>) => {
-    for (const path of paths) {
-      createdFiles.delete(path);
-      await unlink(path).catch(() => {});
-    }
-  };
-  /** Delete leftovers from crashed or killed runs. Only our own file names are touched. */
-  const sweepStale = async () => {
-    let names: string[];
-    try { names = await readdir(tmpdir()); } catch { return; }
-    const cutoff = Date.now() - STALE_MS;
-    for (const name of names) {
-      if (!name.startsWith(TEMP_PREFIX)) continue;
-      const path = join(tmpdir(), name);
-      try {
-        const info = await lstat(path);
-        if (!info.isFile() || info.mtimeMs >= cutoff) continue;
-        await unlink(path);
-      } catch { /* already gone */ }
-    }
-  };
-
-  const saveManifest = async () => {
-    const path = manifestPath();
-    if (!path) return;
-    const images = activeDrafts().map(({ record }) => record);
-    const manifest: DraftManifest = { version: 2, nextId: nextAttachmentId, images };
-    const signature = JSON.stringify(manifest);
-    if (signature === manifestSignature) return manifestWrites;
-    manifestSignature = signature;
-    manifestWrites = manifestWrites.then(async () => {
-      if (!images.length) await unlink(path).catch(() => {});
-      else await writeFile(path, signature, { mode: 0o600 });
-    }).catch(() => { manifestSignature = ""; });
-    return manifestWrites;
-  };
+  const saveManifest = () => manifest ? files.saveManifest(manifest, activeDrafts(), nextAttachmentId) : undefined;
 
   const updateDraftDisplay = () => {
     redraw();
@@ -151,9 +109,10 @@ export default function imagePaste(pi: ExtensionAPI) {
 
   const addDraft = (record: DraftRecord, content: ImageContent, label: string): DraftImage => {
     const { mimeType, data } = content;
-    const draft = { record, label, sourceUrl: record.sourceUrl, mimeType, dimensions: getImageDimensions(data, mimeType), content };
+    const draft = { record, label, sourceUrl: record.sourceUrl, mimeType, dimensions: imageDimensions(data, mimeType), content };
     drafts.set(label, draft);
-    if ("path" in record) createdFiles.add(record.path);
+    selectedText = undefined;
+    files.track(record);
     nextAttachmentId = Math.max(nextAttachmentId, record.id + 1);
     return draft;
   };
@@ -178,9 +137,8 @@ export default function imagePaste(pi: ExtensionAPI) {
 
   const stage = async (image: ImageBytes, token: number, sourceUrl?: string) => {
     if (token !== epoch || !context) return;
-    const path = join(tmpdir(), `${TEMP_PREFIX}${randomUUID()}.${IMAGE_EXTENSIONS[image.mimeType]}`);
-    await writeFile(path, image.bytes, { mode: 0o600, flag: "wx" });
-    if (token !== epoch || !context) { await unlink(path).catch(() => {}); return; }
+    const path = await files.writeImage(image);
+    if (token !== epoch || !context) { await files.release([path]); return; }
     const id = nextAttachmentId;
     const draft = addDraft({ id, path, sourceUrl }, imageContent(image), imageLabel(id, image.bytes));
     insertLabel(draft.label);
@@ -204,7 +162,7 @@ export default function imagePaste(pi: ExtensionAPI) {
       ctx.ui.notify(diagnostics.result, "warning");
       return;
     }
-    await stage(image, token, validTempPath(path) ? undefined : sourceUrl);
+    await stage(image, token, files.isTempImage(path) ? undefined : sourceUrl);
   };
 
   const paste = (trigger: string, path?: string, supplied?: ImageBytes): Promise<void> => {
@@ -304,31 +262,34 @@ export default function imagePaste(pi: ExtensionAPI) {
   pi.on("message_end", (event) => {
     if (event.message.role !== "user" || !Array.isArray(event.message.content)) return;
     const images = event.message.content.filter((part): part is ImageContent => part.type === "image");
+    if (!images.length && !submittedDrafts.length) return;
     const text = event.message.content.filter((part) => part.type === "text").map((part) => part.text).join("\n");
     // Pi can append a size note and replace the image bytes during resizing.
     const submittedIndex = submittedDrafts.findIndex(({ text: prompt }) =>
       text === prompt || text.startsWith(`${prompt}\n\n[Image`));
     const submitted = submittedIndex < 0 ? undefined : submittedDrafts.splice(submittedIndex, 1)[0];
     if (images.length) {
-      const links = new Map(Array.from(text.matchAll(IMAGE_LINK), ([, label, url]) => [label, url]));
+      const links = new Map<string, string>();
+      for (const [, label, url] of text.matchAll(IMAGE_LINK)) links.set(label, url);
       const labels = submitted?.labels.length === images.length ? submitted.labels : [];
       const rows = images.map(({ data, mimeType }, index) => {
         const label = labels[index] ?? imageLabel(nextAttachmentId++, Buffer.from(data, "base64"));
-        return `${linkImageLabel(label, links.get(label))} ${imageSize(mimeType, getImageDimensions(data, mimeType))}`;
+        return `${linkImageLabel(label, links.get(label))} ${imageSize(mimeType, imageDimensions(data, mimeType))}`;
       });
       pendingPreview = `${ATTACHED_IMAGES_HEADING}\n${rows.join("\n")}`;
     }
     if (submitted) {
-      const active = new Set(activeDrafts().map((draft) => draft.label));
+      const active = new Set(activeDrafts());
       const released: string[] = [];
       for (const label of submitted.draftLabels) {
-        if (active.has(label)) continue;
         const draft = drafts.get(label);
-        if (draft && "path" in draft.record) released.push(draft.record.path);
+        if (!draft || active.has(draft)) continue;
+        if ("path" in draft.record) released.push(draft.record.path);
         drafts.delete(label);
+        selectedText = undefined;
       }
       // The sent message now owns the image bytes, so the draft copy is no longer needed.
-      void dropFiles(released);
+      void files.release(released);
     }
     if (images.length || submitted) updateDraftDisplay();
   });
@@ -400,8 +361,9 @@ export default function imagePaste(pi: ExtensionAPI) {
     }
     if (ctx.mode !== "tui") return;
     context = ctx;
+    manifest = files.manifestPath(ctx.sessionManager.getSessionId());
     epoch++;
-    void sweepStale();
+    void files.sweepStale();
     ctx.ui.setWidget("image-paste-cards", (ui, theme) => {
       tui = ui as CapturedTUI;
       return new AttachmentList(
@@ -419,7 +381,7 @@ export default function imagePaste(pi: ExtensionAPI) {
       const focused = getMessageEditor();
       if (!focused || focused === decoratedEditor) return;
       cleanupDecoration?.();
-      cleanupDecoration = decorateImageTokens(focused, lookup);
+      cleanupDecoration = decorateImageTokens(focused, drafts);
       decoratedEditor = focused;
       redraw();
     };
@@ -427,21 +389,15 @@ export default function imagePaste(pi: ExtensionAPI) {
 
     // Reload keeps the draft text. Resolve backing files and message references
     // from the manifest for this session before the editor can submit it again.
-    const path = manifestPath();
-    if (path) {
-      try {
-        const info = await lstat(path);
-        // Windows uses the temp directory's inherited ACLs for newly created files.
-        if (!info.isFile() || info.size > 64 * 1024 ||
-          (process.platform !== "win32" && (info.mode & 0o077) !== 0)) throw new Error("unsafe manifest");
-        const parsed = JSON.parse(await readFile(path, "utf8")) as DraftManifest;
-        if (parsed.version !== 2 || !Array.isArray(parsed.images) || parsed.images.length > 16) throw new Error("invalid manifest");
+    try {
+      const parsed = await files.readManifest(manifest);
+      if (parsed) {
         for (const item of parsed.images) {
           if (!Number.isSafeInteger(item.id) || item.id < 1 || item.id === Number.MAX_SAFE_INTEGER) continue;
           const sourceUrl = typeof item.sourceUrl === "string" && /^file:\/\/[^\s\p{Cc}()]+$/u.test(item.sourceUrl)
             ? item.sourceUrl : undefined;
           if ("path" in item) {
-            if (!validTempPath(item.path)) continue;
+            if (!files.isTempImage(item.path)) continue;
             const image = await loadImagePath(item.path);
             addDraft({ id: item.id, path: item.path, sourceUrl }, imageContent(image), imageLabel(item.id, image.bytes));
           } else {
@@ -456,8 +412,8 @@ export default function imagePaste(pi: ExtensionAPI) {
         if (Number.isSafeInteger(parsed.nextId)) nextAttachmentId = Math.max(nextAttachmentId, parsed.nextId);
         ensureDecorated();
         redraw();
-      } catch { await unlink(path).catch(() => {}); }
-    }
+      }
+    } catch { await files.release([manifest]); }
 
     cleanupInput = ctx.ui.onTerminalInput((data) => {
       ensureDecorated();
@@ -478,11 +434,16 @@ export default function imagePaste(pi: ExtensionAPI) {
         if (queuedInput.length < 4096) queuedInput.push(data);
         return { consume: true };
       }
-      const before = ctx.ui.getEditorText();
-      queueMicrotask(() => {
-        const after = context?.ui.getEditorText();
-        if (after !== undefined && after !== before) updateDraftDisplay();
-      });
+      if (drafts.size && !draftSyncQueued) {
+        // Pi applies the key after calling this listener and redraws the editor itself.
+        const token = epoch;
+        draftSyncQueued = true;
+        queueMicrotask(() => {
+          if (token !== epoch) return;
+          draftSyncQueued = false;
+          void saveManifest();
+        });
+      }
       if (!data.startsWith(PASTE_START) || !data.endsWith(PASTE_END)) return;
       const text = data.slice(PASTE_START.length, -PASTE_END.length);
       if (text && !isImagePath(text)) return;
@@ -508,17 +469,16 @@ export default function imagePaste(pi: ExtensionAPI) {
   // Continue supporting old native Pi clipboard paths for existing drafts.
   pi.on("input", async (event, ctx) => {
     if (event.source !== "interactive") return { action: "continue" };
-    const prefix = join(tmpdir(), "pi-").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    const paths = [...new Set(event.text.match(new RegExp(`${prefix}(?:image-paste|clipboard)-[0-9a-f-]{36}\\.(?:png|jpg|webp|gif)`, "g")) ?? [])];
+    const paths = files.findInPrompt(event.text);
     const selected = activeDrafts(event.text);
-    if (!selected.length && !paths.length) return { action: "continue" };
+    if (!selected.length && !paths) return { action: "continue" };
     if (ctx.model && !ctx.model.input.includes("image")) {
       ctx.ui.setEditorText(event.text);
       redraw();
       ctx.ui.notify(t.modelNoVision, "warning");
       return { action: "handled" };
     }
-    const images: ImageContent[] = [...(event.images ?? [])];
+    const images = event.images?.slice() ?? [];
     let text = event.text;
     try {
       const labels = images.map(({ data }) => imageLabel(nextAttachmentId++, Buffer.from(data, "base64")));
@@ -530,12 +490,14 @@ export default function imagePaste(pi: ExtensionAPI) {
         linkedLabels.set(draft.label, linkImageLabel(draft.label, draft.sourceUrl));
       }
       text = replaceImageLabels(text, (label) => linkedLabels.get(label) ?? label);
-      for (const path of paths) {
-        const image = await loadImagePath(path);
-        const label = imageLabel(nextAttachmentId++, image.bytes);
-        labels.push(label);
-        images.push(imageContent(image));
-        text = text.split(path).join(label);
+      if (paths) {
+        for (const path of new Set(paths)) {
+          const image = await loadImagePath(path);
+          const label = imageLabel(nextAttachmentId++, image.bytes);
+          labels.push(label);
+          images.push(imageContent(image));
+          text = text.replaceAll(path, label);
+        }
       }
       text = text.trim();
       submittedDrafts.push({ text, labels, draftLabels });
@@ -557,21 +519,19 @@ export default function imagePaste(pi: ExtensionAPI) {
     pending = undefined;
     queuedInput.length = 0;
     await saveManifest();
-    const manifest = manifestPath();
     context = undefined;
     tui = undefined;
     decoratedEditor = undefined;
     // Keep hidden backing files and their mapping across /reload.
-    if (event.reason !== "reload") {
-      await dropFiles([...createdFiles]);
-      if (manifest) await unlink(manifest).catch(() => {});
-      createdFiles.clear();
-    }
+    await files.close(manifest, event.reason === "reload");
+    manifest = undefined;
     drafts.clear();
     submittedDrafts.length = 0;
     pendingPreview = undefined;
     treeTargetId = undefined;
     nextAttachmentId = 1;
-    manifestSignature = "";
+    selectedText = undefined;
+    selectedDrafts = noDrafts;
+    draftSyncQueued = false;
   });
 }
